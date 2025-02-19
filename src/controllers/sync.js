@@ -1,61 +1,107 @@
 require("dotenv").config();
-const db = require("../db");
 const axios = require("axios");
+const db = require("../db");
 
-async function syncSpotifyData(req, res) {
+// Function to sync playlists and songs
+async function syncPlaylistsAndSongs(userId) {
   try {
-    const accessToken = req.headers.authorization?.split(" ")[1]; // Get Bearer token
-    if (!accessToken) {
-      return res.status(401).json({ message: "Missing access token" });
-    }
+    // ✅ Step 1: Get User's Access Token from DB
+    const { rows } = await db.query("SELECT access_token FROM users WHERE id = $1", [userId]);
+    if (rows.length === 0) throw new Error("User not found");
+    
+    const accessToken = rows[0].access_token;
 
-    // 1️⃣ Fetch user's playlists from Spotify API
-    const { data: playlistsData } = await axios.get("https://api.spotify.com/v1/me/playlists", {
+    // ✅ Step 2: Fetch User's Playlists from Spotify
+    const playlistsResponse = await axios.get("https://api.spotify.com/v1/me/playlists", {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    for (const playlist of playlistsData.items) {
-      // Insert playlist if it doesn't exist
-      await db.query(
-        `INSERT INTO playlists (spotify_id, name, owner, is_public, total_tracks)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (spotify_id) DO UPDATE SET name = EXCLUDED.name, total_tracks = EXCLUDED.total_tracks`,
-        [playlist.id, playlist.name, playlist.owner.display_name, playlist.public, playlist.tracks.total]
-      );
+    const playlists = playlistsResponse.data.items;
 
-      // 2️⃣ Fetch all songs for this playlist
-      const { data: tracksData } = await axios.get(playlist.tracks.href, {
+    for (const playlist of playlists) {
+      // ✅ Step 3: Store Playlist in Database
+      const playlistQuery = `
+        INSERT INTO playlists (spotify_id, name, owner, is_public, total_tracks)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (spotify_id) DO UPDATE SET total_tracks = $5
+        RETURNING id;
+      `;
+      const playlistValues = [
+        playlist.id,
+        playlist.name,
+        playlist.owner.display_name,
+        playlist.public,
+        playlist.tracks.total,
+      ];
+      const { rows: playlistRows } = await db.query(playlistQuery, playlistValues);
+      const playlistId = playlistRows[0].id;
+
+      // ✅ Step 4: Fetch Songs from Each Playlist
+      const songsResponse = await axios.get(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
 
-      for (const item of tracksData.items) {
-        const track = item.track;
-        if (!track) continue; // Skip if no track data
+      for (const track of songsResponse.data.items) {
+        const song = track.track;
+        if (!song) continue;
 
-        // Insert song if it doesn't exist
-        await db.query(
-          `INSERT INTO songs (spotify_id, name, artist, album, duration_ms, explicit)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (spotify_id) DO NOTHING`,
-          [track.id, track.name, track.artists.map(a => a.name).join(", "), track.album.name, track.duration_ms, track.explicit]
-        );
+        // ✅ Step 5: Fetch Audio Features for Additional Metadata
+        const featuresResponse = await axios.get(`https://api.spotify.com/v1/audio-features/${song.id}`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
 
-        // Link song to playlist in `playlist_songs`
-        await db.query(
-          `INSERT INTO playlist_songs (playlist_id, song_id)
-           SELECT playlists.id, songs.id FROM playlists, songs
-           WHERE playlists.spotify_id = $1 AND songs.spotify_id = $2
-           ON CONFLICT DO NOTHING`,
-          [playlist.id, track.id]
-        );
+        const features = featuresResponse.data || {};
+
+        // ✅ Step 6: Store Song in Database
+        const songQuery = `
+          INSERT INTO songs (
+            spotify_id, name, artist, album, duration_ms, popularity, explicit, preview_url, release_date, 
+            bpm, energy, instrumentalness, key, loudness, mode, track_href, valence
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, 
+            $10, $11, $12, $13, $14, $15, $16, $17
+          )
+          ON CONFLICT (spotify_id) DO NOTHING
+          RETURNING id;
+        `;
+        const songValues = [
+          song.id,
+          song.name,
+          song.artists.map(a => a.name).join(", "),
+          song.album.name,
+          song.duration_ms,
+          song.popularity,
+          song.explicit,
+          song.preview_url,
+          song.album.release_date,
+          features.tempo || null,
+          features.energy || null,
+          features.instrumentalness || null,
+          features.key || null,
+          features.loudness || null,
+          features.mode || null,
+          song.href,
+          features.valence || null,
+        ];
+        const { rows: songRows } = await db.query(songQuery, songValues);
+        const songId = songRows.length > 0 ? songRows[0].id : null;
+
+        // ✅ Step 7: Store Relationship in playlist_songs Table
+        if (songId) {
+          await db.query(`
+            INSERT INTO playlist_songs (playlist_id, song_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING;
+          `, [playlistId, songId]);
+        }
       }
     }
 
-    res.status(200).json({ message: "Sync successful" });
+    return { message: "Sync complete!" };
   } catch (error) {
     console.error("Sync error:", error);
-    res.status(500).json({ message: "Error syncing Spotify data" });
+    throw error;
   }
 }
 
-module.exports = { syncSpotifyData };
+module.exports = { syncPlaylistsAndSongs };
