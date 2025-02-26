@@ -1,21 +1,27 @@
 const express = require("express");
-const db = require("../db");
 const { syncPlaylists } = require("../controllers/sync");
 
 const router = express.Router();
 
-// 🎵 Get All Playlists
-router.get("/playlists", async (req, res) => {
+router.post("/api/sync", async (req, res) => {
   try {
-    const result = await db.query("SELECT * FROM playlists");
-    res.json(result.rows);
+    console.log("📥 Received Sync Request Body:", req.body);
+
+    const { accessToken, userId, playlists } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required." });
+    }
+
+    console.log(`✅ Received ${playlists.length} playlists from user ${userId}`);
+
+    const result = await syncPlaylists(userId, playlists);
+    res.json({ message: "Playlists synced!", result });
+
   } catch (error) {
-    console.error("❌ Error fetching playlists:", error);
+    console.error("❌ Error syncing playlists:", error);
     res.status(500).json({ message: "Server Error" });
   }
 });
-
-// 🔄 Sync Playlists with Spotify API
-router.post("/sync", syncPlaylists);
 
 module.exports = router;
